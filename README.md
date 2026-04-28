@@ -1,6 +1,6 @@
 # Event-Driven Reconciliation on AWS (CloudFormation)
 
-![Architecture Diagram](docs/architecture.png)
+![Architecture Diagram](docs/ewalletrecon05.png)
 
 This repository contains an AWS CloudFormation template that implements a scalable, serverless, event-driven reconciliation system for processing e-wallet transactions and external payment provider events.
 
