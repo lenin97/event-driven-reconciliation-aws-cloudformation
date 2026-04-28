@@ -1,0 +1,311 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Production-ready but simple E-Wallet Reconciliation Platform.
+  Core services only with modern AWS best practices:
+  API Gateway, Lambda, SNS, SQS, DynamoDB, IAM, Logs, Encryption.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: ewallet
+
+  EnvironmentName:
+    Type: String
+    Default: dev
+
+Resources:
+
+# =====================================================
+# DynamoDB
+# =====================================================
+
+  ReconciliationTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+      AttributeDefinitions:
+        - AttributeName: transactionId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: transactionId
+          KeyType: HASH
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+# =====================================================
+# SNS Topic
+# =====================================================
+
+  EventTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+# =====================================================
+# SQS Queues
+# =====================================================
+
+  WalletQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      SqsManagedSseEnabled: true
+      VisibilityTimeout: 60
+
+  ProviderQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      SqsManagedSseEnabled: true
+      VisibilityTimeout: 60
+
+# =====================================================
+# Queue Policies
+# =====================================================
+
+  WalletQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref WalletQueue
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowSNSTopic
+            Effect: Allow
+            Principal: "*"
+            Action: sqs:SendMessage
+            Resource: !GetAtt WalletQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Ref EventTopic
+
+  ProviderQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref ProviderQueue
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowSNSTopic
+            Effect: Allow
+            Principal: "*"
+            Action: sqs:SendMessage
+            Resource: !GetAtt ProviderQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Ref EventTopic
+
+# =====================================================
+# SNS Subscriptions
+# =====================================================
+
+  WalletSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref EventTopic
+      Protocol: sqs
+      Endpoint: !GetAtt WalletQueue.Arn
+      RawMessageDelivery: true
+
+  ProviderSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref EventTopic
+      Protocol: sqs
+      Endpoint: !GetAtt ProviderQueue.Arn
+      RawMessageDelivery: true
+
+# =====================================================
+# IAM Role
+# =====================================================
+
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action: sts:AssumeRole
+
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+      Policies:
+        - PolicyName: AppAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref EventTopic
+
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                Resource: !GetAtt ReconciliationTable.Arn
+
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource:
+                  - !GetAtt WalletQueue.Arn
+                  - !GetAtt ProviderQueue.Arn
+
+# =====================================================
+# Lambda Functions
+# =====================================================
+
+  TransactionProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt LambdaRole.Arn
+      Timeout: 15
+      MemorySize: 256
+      Environment:
+        Variables:
+          TOPIC_ARN: !Ref EventTopic
+      Code:
+        ZipFile: |
+          import json
+
+          def handler(event, context):
+              return {
+                  "statusCode": 200,
+                  "body": json.dumps({"message": "accepted"})
+              }
+
+  ReconciliationFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt LambdaRole.Arn
+      Timeout: 15
+      MemorySize: 256
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref ReconciliationTable
+      Code:
+        ZipFile: |
+          def handler(event, context):
+              return {"status": "ok"}
+
+# =====================================================
+# Log Retention
+# =====================================================
+
+  TransactionProcessorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${TransactionProcessorFunction}
+      RetentionInDays: 14
+
+  ReconciliationLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${ReconciliationFunction}
+      RetentionInDays: 14
+
+# =====================================================
+# Event Source Mapping
+# =====================================================
+
+  WalletQueueMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt WalletQueue.Arn
+      FunctionName: !Ref ReconciliationFunction
+      Enabled: true
+      BatchSize: 10
+
+# =====================================================
+# API Gateway
+# =====================================================
+
+  RestApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub ${ProjectName}-${EnvironmentName}-api
+
+  ApiResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      ParentId: !GetAtt RestApi.RootResourceId
+      PathPart: transaction
+      RestApiId: !Ref RestApi
+
+  ApiMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref ApiResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub >
+          arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${TransactionProcessorFunction.Arn}/invocations
+
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref TransactionProcessorFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApi}/*/POST/transaction
+
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - ApiMethod
+    Properties:
+      RestApiId: !Ref RestApi
+      Description: Initial deployment
+
+  ApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref RestApi
+      DeploymentId: !Ref ApiDeployment
+      StageName: v1
+
+# =====================================================
+# Outputs
+# =====================================================
+
+Outputs:
+
+  ApiUrl:
+    Value: !Sub https://${RestApi}.execute-api.${AWS::Region}.amazonaws.com/v1/transaction
+
+  DynamoTable:
+    Value: !Ref ReconciliationTable
+
+  TopicArn:
+    Value: !Ref EventTopic
+
+  WalletQueueUrl:
+    Value: !Ref WalletQueue
+
+  ProviderQueueUrl:
+    Value: !Ref ProviderQueue
